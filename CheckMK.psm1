@@ -42,67 +42,101 @@ function Set-CertificateValidationPolicy {
     }
 }
 function Get-CMKConnection {
-    [CmdletBinding()]
+    [CmdletBinding(DefaultParameterSetName = 'Credential')]
     param (
-        [parameter(Mandatory, HelpMessage = 'DNS-Name des CheckMK-Servers')]
+        [parameter(Mandatory, ParameterSetName = 'Credential', HelpMessage = 'DNS-Name des CheckMK-Servers')]
+        [parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'DNS-Name des CheckMK-Servers')]
         [ValidateNotNullOrEmpty()]
         [string]
         $Hostname,
-        [parameter(Mandatory, HelpMessage = 'Instanz auf dem CheckMK-Server')]
+
+        [parameter(Mandatory, ParameterSetName = 'Credential', HelpMessage = 'Instanz auf dem CheckMK-Server')]
+        [parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'Instanz auf dem CheckMK-Server')]
         [ValidateNotNullOrEmpty()]
         [string]
         $Sitename,
-        [parameter(HelpMessage = 'Benutzer mit genügend Rechten in CheckMK. Per Standard wird der Skriptausführende Benutzer gewählt.')]
+
+        [Parameter(Mandatory, ParameterSetName = 'Credential', HelpMessage = 'Credential Objekt zum Anmelden an der CheckMK-API')]
+        [pscredential]
+        $Credential,
+
+        [parameter(ParameterSetName = 'UserPassword', HelpMessage = 'Benutzer mit genügend Rechten in CheckMK. Per Standard wird der Skriptausführende Benutzer gewählt.')]
         [string]
         $Username,
-		[parameter(Mandatory, HelpMessage = 'Passwort zum Zugriff auf die CheckMK API.')]
+
+		[parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'Passwort zum Zugriff auf die CheckMK API.')]
 		[SecureString]
 		$Secret,
-        [parameter(HelpMessage = 'Wenn bestehende Objekte bearbeitet werden sollen, muss das ETag des Objektes zuvor abgerufen und bei der Änderungsanfrage in den Header eingefügt werden.')]
+
+        [parameter(ParameterSetName = 'Credential', HelpMessage = 'Wenn bestehende Objekte bearbeitet werden sollen, muss das ETag des Objektes zuvor abgerufen und bei der Änderungsanfrage in den Header eingefügt werden.')]
+        [parameter(ParameterSetName = 'UserPassword', HelpMessage = 'Wenn bestehende Objekte bearbeitet werden sollen, muss das ETag des Objektes zuvor abgerufen und bei der Änderungsanfrage in den Header eingefügt werden.')]
         [ValidateNotNullOrEmpty()]
         [string]
         $IfMatch
     )
-    If (-not $PSBoundParameters.ContainsKey('Username')) {
-        $PSBoundParameters.Username = [System.Environment]::UserName
+
+    if ($PSCmdlet.ParameterSetName -eq 'UserSecret') {
+        $Credential = New-Object System.Management.Automation.PSCredential ($Username, $Secret)
     }
+    elseif (-not $Credential) {
+        # Falls nichts angegeben, Standard holen
+        $Credential = Get-Credential -UserName $env:USERNAME
+    }
+
     $Connection = @{
         hostname = $Hostname
         sitename = $Sitename
-        username = $PSBoundParameters.Username
+        username = $Credential.UserName
         APIUrl   = "https://$hostname/$sitename/check_mk/api/1.0"
         Header   = Get-CMKHeader @PSBoundParameters
     }
+
     return $Connection
 }
 function Get-CMKHeader {
-    [CmdletBinding()]
+    [CmdletBinding(DefaultParameterSetName = 'Credential')]
     param (
-        [parameter(Mandatory, HelpMessage = 'DNS-Name des CheckMK-Servers')]
+        [parameter(Mandatory, ParameterSetName = 'Credential', HelpMessage = 'DNS-Name des CheckMK-Servers')]
+        [parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'DNS-Name des CheckMK-Servers')]
         [ValidateNotNullOrEmpty()]
         [string]
         $Hostname,
-        [parameter(Mandatory, HelpMessage = 'Instanz auf dem CheckMK-Server')]
+
+        [parameter(Mandatory, ParameterSetName = 'Credential', HelpMessage = 'Instanz auf dem CheckMK-Server')]
+        [parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'Instanz auf dem CheckMK-Server')]
         [ValidateNotNullOrEmpty()]
         [string]
         $Sitename,
-        [parameter(Mandatory, HelpMessage = 'Benutzer mit genügend API-Rechten in CheckMK.')]
+
+        [parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'Benutzer mit genügend API-Rechten in CheckMK.')]
         [ValidateNotNullOrEmpty()]
         [string]
         $Username,
-        [parameter(Mandatory, HelpMessage = 'Passwort zum Zugriff auf die CheckMK API.')]
+
+        [parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'Passwort zum Zugriff auf die CheckMK API.')]
         [ValidateNotNullOrEmpty()]
 		[SecureString]
 		$Secret,
-        [parameter(HelpMessage = 'Wenn bestehende Objekte bearbeitet werden sollen, muss das ETag des Objektes zuvor abgerufen und bei der Änderungsanfrage in den Header eingefügt werden.')]
+
+        [parameter(Mandatory, ParameterSetName = 'Credential', HelpMessage = 'Credential Objekt zur Authentifizierung and der CheckMK-API')]
+        [ValidateNotNullOrEmpty()]
+        [pscredential]
+        $Credential,
+
+        [parameter(ParameterSetName = 'Credential', HelpMessage = 'Wenn bestehende Objekte bearbeitet werden sollen, muss das ETag des Objektes zuvor abgerufen und bei der Änderungsanfrage in den Header eingefügt werden.')]
+        [parameter(ParameterSetName = 'UserPassword', HelpMessage = 'Wenn bestehende Objekte bearbeitet werden sollen, muss das ETag des Objektes zuvor abgerufen und bei der Änderungsanfrage in den Header eingefügt werden.')]
         [ValidateNotNullOrEmpty()]
         [string]
         $IfMatch
     )
 
-
 	# Ab PS7 wird ConvertFrom-SecureString möglich
     $password = [System.Net.NetworkCredential]::new("", $Secret).Password
+
+    if ($PSCmdlet.ParameterSetName -eq 'Credential') {
+        $Username = $Credential.UserName
+        $password = $Credential.GetNetworkCredential().Password
+    }
 
     $header = New-Object -TypeName 'System.Collections.Generic.Dictionary[[string],[string]]'
     $header.Add('Authorization', "Bearer $username $password")
@@ -312,7 +346,7 @@ function New-CMKHost {
         [Parameter(Mandatory)]
         [string]
         $HostName,
-        [Parameter(Mandatory, HelpMessage = 'Pfad zum Ordner. Case-Sensitive. Entspricht dem Attribut path im Objekt von Get-CheckMKFolder.')]
+        [Parameter(Mandatory, HelpMessage = 'Pfad zum Ordner. Anstelle von Slash bitte Tilde ~ benutzen. Case-Sensitive. Entspricht dem Attribut id im Objekt von Get-CheckMKFolder.')]
         [string]
         $FolderPath,
         [parameter(Mandatory)]
