@@ -22,6 +22,451 @@
 
 #>
 #region Connection
+
+# Beispiel für Nutzung:
+<#
+# Verbindung aufbauen
+$securePassword = Read-Host "CheckMK Passwort" -AsSecureString
+$connection = Connect-CMK -Hostname "checkmk.example.com" -Sitename "prod" -Username "automation" -Secret $securePassword -TestConnection
+
+# Verwenden
+$hosts = Get-CMKHost -Connection $connection
+$serverInfo = Get-CMKServerInfo -Connection $connection
+
+# Später wiederverwenden (ohne erneute Passwort-Eingabe)
+$connection = Connect-CMK -Hostname "checkmk.example.com" -Sitename "prod"
+
+# Verbindung beenden
+Disconnect-CMK -Connection $connection
+#>
+
+# Sichere Connection-Klasse
+
+$ExistingTypes = [AppDomain]::CurrentDomain.GetAssemblies() | 
+    ForEach-Object { 
+        $assembly = $_
+        $_.GetTypes() | Where-Object { $_.Name -eq 'CMKConnection' } |
+        ForEach-Object { [PSCustomObject]@{ Type = $_; Assembly = $assembly.FullName } }
+    }
+
+if (-not $ExistingTypes) {
+     class CMKConnection {
+        [string] $Hostname
+        [string] $Sitename  
+        [string] $Username
+        [securestring] $Secret
+        [string] $BaseUrl
+        [datetime] $ConnectedAt
+        [datetime] $LastUsed
+        [int] $TimeoutMinutes
+        [bool] $SkipCertificateCheck
+        [hashtable] $SessionHeaders
+        [bool] $IsValid
+
+        # Konstruktor
+        CMKConnection([string]$Hostname, [string]$Sitename, [string]$Username, [securestring]$Secret) {
+            $this.Hostname = $Hostname
+            $this.Sitename = $Sitename
+            $this.Username = $Username
+            $this.Secret = $Secret
+            $this.BaseUrl = "https://$Hostname/$Sitename/check_mk/api/1.0"
+            $this.TimeoutMinutes = 60
+            $this.SkipCertificateCheck = $false
+            $this.ConnectedAt = Get-Date
+            $this.LastUsed = Get-Date
+            $this.IsValid = $false
+        }
+
+        # Sichere Header-Generierung ohne Passwort-Extraktion
+        [hashtable] GetHeaders([string]$IfMatch) {
+            $this.LastUsed = Get-Date
+            
+            # Sichere Passwort-Konvertierung nur wenn nötig
+            $password = [System.Net.NetworkCredential]::new("", $this.Secret).Password
+            
+            $headers = @{
+                'Authorization' = "Bearer $($this.Username) $password"
+                'Accept' = 'application/json'
+                'Content-Type' = 'application/json'
+            }
+            
+            if ($IfMatch) {
+                $headers['If-Match'] = $IfMatch
+            }
+            
+            # Passwort aus Memory löschen
+            $password = $null
+            [System.GC]::Collect()
+            
+            return $headers
+        }
+
+        # Connection-Gültigkeitsprüfung
+        [bool] IsConnectionValid() {
+            if (-not $this.IsValid) { return $false }
+            
+            $timeSinceLastUse = (Get-Date) - $this.LastUsed
+            return $timeSinceLastUse.TotalMinutes -lt $this.TimeoutMinutes
+        }
+
+        # Teste die Verbindung
+        [bool] TestConnection() {
+            try {
+                # Netzwerk-Test
+                if (-not (Test-NetConnection -ComputerName $this.Hostname -Port 443 -WarningAction SilentlyContinue).TcpTestSucceeded) {
+                    Write-Verbose "$($this.Hostname) ist nicht über Port 443 erreichbar"
+                    return $false
+                }
+
+                # API-Test mit /version endpoint
+                $headers = $this.GetHeaders($null)
+                $response = Invoke-WebRequest -Uri "$($this.BaseUrl)/version" -Headers $headers -Method Get -UseBasicParsing
+                
+                if ($response.StatusCode -eq 200) {
+                    $this.IsValid = $true
+                    $this.ConnectedAt = Get-Date
+                    return $true
+                }
+            }
+            catch {
+                Write-Verbose "Connection test failed: $($_.Exception.Message)"
+                $this.IsValid = $false
+                return $false
+            }
+            
+            return $false
+        }
+    }
+}
+
+function Connect-CMK {
+    <#
+    .SYNOPSIS
+        Stellt eine sichere Verbindung zur CheckMK REST API her
+    
+    .DESCRIPTION
+        Erstellt eine persistente, sichere Verbindung zur CheckMK REST API mit verbessertem
+        Session-Management und Credential-Handling. Unterstützt verschiedene Authentifizierungsmethoden.
+    
+    .PARAMETER Hostname
+        DNS-Name oder IP-Adresse des CheckMK-Servers
+    
+    .PARAMETER Sitename
+        Name der CheckMK-Site/Instanz
+    
+    .PARAMETER Username
+        Benutzername (vorzugsweise Automation User)
+    
+    .PARAMETER Secret
+        Passwort als SecureString
+    
+    .PARAMETER Credential
+        PSCredential-Objekt (Alternative zu Username/Secret)
+    
+    .PARAMETER UseHTTPS
+        Erzwingt HTTPS-Verbindung (Standard: true)
+    
+    .PARAMETER Port
+        Port für die Verbindung (Standard: 443 für HTTPS, 80 für HTTP)
+    
+    .PARAMETER SkipCertificateCheck
+        Überspringt Zertifikatsprüfung (nur für Test-Umgebungen)
+    
+    .PARAMETER TimeoutMinutes
+        Session-Timeout in Minuten (Standard: 60)
+    
+    .PARAMETER TestConnection
+        Testet die Verbindung beim Aufbau
+    
+    .EXAMPLE
+        $connection = Connect-CMK -Hostname "checkmk.example.com" -Sitename "prod" -Username "automation" -Secret $securePassword
+    
+    .EXAMPLE
+        $cred = Get-Credential
+        $connection = Connect-CMK -Hostname "192.168.1.100" -Sitename "test" -Credential $cred -SkipCertificateCheck
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'UserSecret')]
+    [OutputType([CMKConnection])]
+    param(
+        [Parameter(Mandatory = $true, HelpMessage = 'DNS-Name oder IP-Adresse des CheckMK-Servers')]
+        [ValidateNotNullOrEmpty()]
+        [string] $Hostname,
+
+        [Parameter(Mandatory = $true, HelpMessage = 'Name der CheckMK-Site/Instanz')]
+        [ValidateNotNullOrEmpty()]
+        [string] $Sitename,
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'UserSecret', HelpMessage = 'Benutzername für CheckMK API')]
+        [string] $Username,
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'UserSecret', HelpMessage = 'Passwort als SecureString')]
+        [securestring] $Secret,
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'Credential', HelpMessage = 'PSCredential-Objekt')]
+        [pscredential] $Credential,
+
+        [Parameter(Mandatory = $false, HelpMessage = 'Verwende HTTPS (empfohlen)')]
+        [bool] $UseHTTPS = $true,
+
+        [Parameter(Mandatory = $false, HelpMessage = 'Port für die Verbindung')]
+        [ValidateRange(1, 65535)]
+        [int] $Port,
+
+        [Parameter(Mandatory = $false, HelpMessage = 'Überspringe Zertifikatsprüfung (nur für Test-Umgebungen)')]
+        [switch] $SkipCertificateCheck,
+
+        [Parameter(Mandatory = $false, HelpMessage = 'Session-Timeout in Minuten')]
+        [ValidateRange(1, 1440)]
+        [int] $TimeoutMinutes = 60,
+
+        [Parameter(Mandatory = $false, HelpMessage = 'Teste Verbindung beim Aufbau')]
+        [switch] $TestConnection
+    )
+
+    # Parameter-Setup basierend auf ParameterSet
+    switch ($PSCmdlet.ParameterSetName) {
+        'Credential' {
+            $Username = $Credential.UserName
+            $Secret = $Credential.Password
+        }
+        'UserSecret' {
+            # Username und Secret bereits gesetzt
+        }
+    }
+
+    # Standard-Username falls nicht gesetzt
+    if (-not $Username) {
+        $Username = $env:USERNAME
+        Write-Verbose "Verwende aktuellen Benutzer: $Username"
+    }
+
+    # Port-Setup
+    if (-not $Port) {
+        $Port = if ($UseHTTPS) { 443 } else { 80 }
+    }
+
+    # URL-Setup
+    $protocol = if ($UseHTTPS) { "https" } else { "http" }
+    $baseUrl = if ($Port -in @(80, 443)) {
+        "$protocol`://$Hostname/$Sitename/check_mk/api/1.0"
+    } else {
+        "$protocol`://$Hostname`:$Port/$Sitename/check_mk/api/1.0"
+    }
+
+    # Certificate Policy für PowerShell 5.x
+    if ($SkipCertificateCheck -and $PSVersionTable.PSVersion -like '5.*') {
+        Set-CertificateValidationPolicy
+    }
+
+    # Connection-Objekt erstellen
+    try {
+        $connection = [CMKConnection]::new($Hostname, $Sitename, $Username, $Secret)
+        $connection.BaseUrl = $baseUrl
+        $connection.TimeoutMinutes = $TimeoutMinutes
+        $connection.SkipCertificateCheck = $SkipCertificateCheck.IsPresent
+
+        # Verbindungstest falls gewünscht
+        if ($TestConnection.IsPresent) {
+            Write-Verbose "Teste Verbindung zu $baseUrl..."
+            
+            if (-not $connection.TestConnection()) {
+                throw "Verbindungstest zu $Hostname/$Sitename fehlgeschlagen"
+            }
+            
+            Write-Verbose "Verbindung erfolgreich getestet"
+        }
+
+        # Globale Connection für Backward-Compatibility
+        $Global:CMKConnection = $connection
+
+        Write-Verbose "CheckMK-Verbindung erfolgreich aufgebaut zu $($connection.BaseUrl)"
+        return $connection
+    }
+    catch {
+        Write-Error "Fehler beim Verbindungsaufbau: $($_.Exception.Message)"
+        throw
+    }
+}
+
+function Disconnect-CMK {
+    <#
+    .SYNOPSIS
+        Beendet die CheckMK-Verbindung sicher
+    
+    .DESCRIPTION
+        Löscht sensitive Daten aus dem Memory und beendet die Session
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false, HelpMessage = 'Connection-Objekt zum Beenden')]
+        [CMKConnection] 
+        $Connection = $Global:CMKConnection
+    )
+
+    if ($Connection) {
+        # Sensitive Daten löschen
+        $Connection.Secret = $null
+        $Connection.SessionHeaders = $null
+        $Connection.IsValid = $false
+        
+        # Globale Variable löschen
+        if ($Global:CMKConnection -eq $Connection) {
+            Remove-Variable -Name CMKConnection -Scope Global -Force -ErrorAction SilentlyContinue
+        }
+        
+        # Garbage Collection
+        [System.GC]::Collect()
+        
+        Write-Verbose "CheckMK-Verbindung beendet"
+    }
+}
+
+function Test-CMKConnection {
+    <#
+    .SYNOPSIS
+        Testet eine CheckMK-Verbindung
+    
+    .DESCRIPTION
+        Überprüft ob eine CheckMK-Verbindung noch gültig und funktionsfähig ist
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $false, HelpMessage = 'Connection-Objekt zum Testen')]
+        [CMKConnection] 
+        $Connection = $CMKConnection
+    )
+
+    if (-not $Connection) {
+        Write-Verbose "Keine Connection übergeben"
+        return $false
+    }
+
+    if (-not $Connection.IsConnectionValid()) {
+        Write-Verbose "Connection ist abgelaufen oder ungültig"
+        return $false
+    }
+
+    return $Connection.TestConnection()
+}
+
+# Verbesserte API-Call Funktion mit automatischer Session-Verwaltung
+function Invoke-CMKApiCall {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [Microsoft.PowerShell.Commands.WebRequestMethod] $Method,
+        
+        [Parameter(Mandatory = $true, HelpMessage = 'Sub-URI der API Funktion (mit / ab der Versionsangabe)')]
+        [ValidateNotNullOrEmpty()]
+        [string] $Uri,
+        
+        [Parameter(Mandatory = $true)]
+        [CMKConnection] $Connection,
+        
+        [Parameter(Mandatory = $false)]
+        [object] $Body,
+        
+        [Parameter(Mandatory = $false)]
+        [switch] $EndpointReturnsList,
+        
+        [Parameter(Mandatory = $false, HelpMessage = 'ETag für If-Match Header')]
+        [string] $IfMatch
+    )
+
+    # Session-Gültigkeit prüfen
+    if (-not $Connection.IsConnectionValid()) {
+        Write-Verbose "Session abgelaufen, teste Verbindung neu..."
+        
+        if (-not $Connection.TestConnection()) {
+            throw "CheckMK-Verbindung ist nicht mehr gültig. Bitte neu verbinden mit Connect-CMK."
+        }
+    }
+
+    # Headers abrufen
+    $headers = $Connection.GetHeaders($IfMatch)
+    
+    # Request-Parameter vorbereiten
+    $requestParams = @{
+        Uri = "$($Connection.BaseUrl)$Uri"
+        Method = $Method
+        Headers = $headers
+        UseBasicParsing = $true
+    }
+
+    # Body hinzufügen falls vorhanden
+    if ($Body) {
+        if ($Body -is [string]) {
+            $requestParams.Body = $Body
+        } else {
+            $requestParams.Body = $Body | ConvertTo-Json -Depth 10
+        }
+    }
+
+    # Certificate Check für PowerShell 7+
+    if ($Connection.SkipCertificateCheck -and $PSVersionTable.PSVersion.Major -ge 7) {
+        $requestParams.SkipCertificateCheck = $true
+    }
+
+    try {
+        Write-Verbose "$Method $($requestParams.Uri)"
+        
+        $response = Invoke-WebRequest @requestParams
+        
+        Write-Verbose "Response: $($response.StatusCode) $($response.StatusDescription)"
+        
+        # Erfolgreiche Antwort verarbeiten
+        if ($response.StatusCode -eq 200) {
+            $checkMKObject = ($response.Content | ConvertFrom-Json)
+            
+            # ETag hinzufügen falls vorhanden
+            if ($response.Headers.ETag) {
+                $checkMKObject | Add-Member -MemberType NoteProperty -Name ETag -Value $response.Headers.ETag -Force
+            }
+
+            if ($EndpointReturnsList.IsPresent -and $checkMKObject.Value) {
+                return $checkMKObject.Value
+            } else {
+                return $checkMKObject
+            }
+        }
+        elseif (@('Post', 'Delete', 'Put') -contains $Method -and $response.StatusCode -eq 204) {
+            # 204 No Content - Erfolgreiche Operation ohne Rückgabe
+            return $true
+        }
+        else {
+            throw "Unerwarteter Status Code: $($response.StatusCode)"
+        }
+    }
+    <#
+    PS5 kennt Typ nicht und wirft Fehler
+    catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+        # PowerShell 7+ HTTP Fehler
+        $errorResponse = $_.Exception.Response
+        $errorContent = ""
+        
+        if ($errorResponse.Content) {
+            $errorContent = $errorResponse.Content | ConvertFrom-Json | ConvertTo-Json -Depth 3
+        }
+        
+        $errorMessage = "HTTP $([int]$errorResponse.StatusCode) $($errorResponse.ReasonPhrase)"
+        if ($errorContent) {
+            $errorMessage += "`nDetails: $errorContent"
+        }
+        
+        throw $errorMessage
+    }
+    #>
+    catch [System.Net.WebException] {
+        # PowerShell 5.x HTTP Fehler
+        $ErrMessage =  $_.ErrorDetails.Message;
+        Write-Verbose "An exception was caught: $($_.Exception.Message)"
+        $ResponseErrorObj = $_.Exception.Response # Nur BaseResponse bei Exceptions möglich
+        Add-Member -InputObject $ResponseErrorObj -NotePropertyName ErrorMessage -NotePropertyValue $ErrMessage # add catched error message to $BaseResponse object
+        throw ($ResponseErrorObj | Out-String)
+    }
+}
+
 function Set-CertificateValidationPolicy {
     # Alternative zu invoke-webRequest -SkipCertificateCheck, welches es nur in PowerShell 7 gibt
     # Die Änderung soll nur in PS5 erfolgen. Ab PS7 bitte den Schalter an Invoke-Webrequest nutzen
@@ -41,90 +486,39 @@ function Set-CertificateValidationPolicy {
         }
     }
 }
-function Get-CMKConnection {
-    [CmdletBinding(DefaultParameterSetName = 'Credential')]
-    param (
-        [parameter(Mandatory, ParameterSetName = 'Credential', HelpMessage = 'DNS-Name des CheckMK-Servers')]
-        [parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'DNS-Name des CheckMK-Servers')]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $Hostname,
 
-        [parameter(Mandatory, ParameterSetName = 'Credential', HelpMessage = 'Instanz auf dem CheckMK-Server')]
-        [parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'Instanz auf dem CheckMK-Server')]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $Sitename,
-
-        [Parameter(Mandatory, ParameterSetName = 'Credential', HelpMessage = 'Credential Objekt zum Anmelden an der CheckMK-API')]
-        [pscredential]
-        $Credential,
-
-        [parameter(ParameterSetName = 'UserPassword', HelpMessage = 'Benutzer mit genügend Rechten in CheckMK. Per Standard wird der Skriptausführende Benutzer gewählt.')]
-        [string]
-        $Username,
-
-		[parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'Passwort zum Zugriff auf die CheckMK API.')]
-		[SecureString]
-		$Secret,
-
-        [parameter(ParameterSetName = 'Credential', HelpMessage = 'Wenn bestehende Objekte bearbeitet werden sollen, muss das ETag des Objektes zuvor abgerufen und bei der Änderungsanfrage in den Header eingefügt werden.')]
-        [parameter(ParameterSetName = 'UserPassword', HelpMessage = 'Wenn bestehende Objekte bearbeitet werden sollen, muss das ETag des Objektes zuvor abgerufen und bei der Änderungsanfrage in den Header eingefügt werden.')]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $IfMatch
-    )
-
-    if ($PSCmdlet.ParameterSetName -eq 'UserSecret') {
-        $Credential = New-Object System.Management.Automation.PSCredential ($Username, $Secret)
-    }
-    elseif (-not $Credential) {
-        # Falls nichts angegeben, Standard holen
-        $Credential = Get-Credential -UserName $env:USERNAME
-    }
-
-    $Connection = @{
-        hostname = $Hostname
-        sitename = $Sitename
-        username = $Credential.UserName
-        APIUrl   = "https://$hostname/$sitename/check_mk/api/1.0"
-        Header   = Get-CMKHeader @PSBoundParameters
-    }
-
-    return $Connection
-}
 function Get-CMKHeader {
     [CmdletBinding(DefaultParameterSetName = 'Credential')]
     param (
-        [parameter(Mandatory, ParameterSetName = 'Credential', HelpMessage = 'DNS-Name des CheckMK-Servers')]
-        [parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'DNS-Name des CheckMK-Servers')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'Credential', HelpMessage = 'DNS-Name des CheckMK-Servers')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'UserPassword', HelpMessage = 'DNS-Name des CheckMK-Servers')]
         [ValidateNotNullOrEmpty()]
         [string]
         $Hostname,
 
-        [parameter(Mandatory, ParameterSetName = 'Credential', HelpMessage = 'Instanz auf dem CheckMK-Server')]
-        [parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'Instanz auf dem CheckMK-Server')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'Credential', HelpMessage = 'Instanz auf dem CheckMK-Server')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'UserPassword', HelpMessage = 'Instanz auf dem CheckMK-Server')]
         [ValidateNotNullOrEmpty()]
         [string]
         $Sitename,
 
-        [parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'Benutzer mit genügend API-Rechten in CheckMK.')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'UserPassword', HelpMessage = 'Benutzer mit genügend API-Rechten in CheckMK.')]
         [ValidateNotNullOrEmpty()]
         [string]
         $Username,
 
-        [parameter(Mandatory, ParameterSetName = 'UserPassword', HelpMessage = 'Passwort zum Zugriff auf die CheckMK API.')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'UserPassword', HelpMessage = 'Passwort zum Zugriff auf die CheckMK API.')]
         [ValidateNotNullOrEmpty()]
 		[SecureString]
 		$Secret,
 
-        [parameter(Mandatory, ParameterSetName = 'Credential', HelpMessage = 'Credential Objekt zur Authentifizierung and der CheckMK-API')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'Credential', HelpMessage = 'Credential Objekt zur Authentifizierung and der CheckMK-API')]
         [ValidateNotNullOrEmpty()]
         [pscredential]
         $Credential,
 
-        [parameter(ParameterSetName = 'Credential', HelpMessage = 'Wenn bestehende Objekte bearbeitet werden sollen, muss das ETag des Objektes zuvor abgerufen und bei der Änderungsanfrage in den Header eingefügt werden.')]
-        [parameter(ParameterSetName = 'UserPassword', HelpMessage = 'Wenn bestehende Objekte bearbeitet werden sollen, muss das ETag des Objektes zuvor abgerufen und bei der Änderungsanfrage in den Header eingefügt werden.')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'Credential', HelpMessage = 'Wenn bestehende Objekte bearbeitet werden sollen, muss das ETag des Objektes zuvor abgerufen und bei der Änderungsanfrage in den Header eingefügt werden.')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'UserPassword', HelpMessage = 'Wenn bestehende Objekte bearbeitet werden sollen, muss das ETag des Objektes zuvor abgerufen und bei der Änderungsanfrage in den Header eingefügt werden.')]
         [ValidateNotNullOrEmpty()]
         [string]
         $IfMatch
@@ -150,17 +544,20 @@ function Get-CMKHeader {
 function Invoke-CustomWebRequest {
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
         [Microsoft.PowerShell.Commands.WebRequestMethod]
         $Method,
-        [parameter(Mandatory)]
+
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]
         $Uri,
-        [parameter(Mandatory)]
+
+        [Parameter(Mandatory = $true)]
         [Object]
         $Headers,
-        [parameter()]
+
+        [Parameter(Mandatory = $false)]
         [object]
         $Body
     )
@@ -186,113 +583,50 @@ function Invoke-CustomWebRequest {
     $ResponseObject = New-Object -TypeName psobject -Property $ResponseHash
     return $ResponseObject
 }
-function Invoke-CMKApiCall {
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory)]
-        [Microsoft.PowerShell.Commands.WebRequestMethod]
-        $Method,
-        [parameter(Mandatory, HelpMessage = 'Sub-URI der API Funktion (mit / ab der Versionsangabe)')]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $Uri,
-        [parameter(Mandatory)]
-        [object]
-        $Connection,
-        [parameter()]
-        [object]
-        $Body,
-        [Parameter()]
-        [switch]
-        $EndpointReturnsList
-    )
-    # Wandelt das Ergebnis einer CustomWebRequest zu einem Objekt.
-    $ConnectionCheckIntervalMinutes = 60
-    If ($Global:CMKLastSuccessfulConnect -and (($Global:CMKLastSuccessfulConnect | Get-Date) -gt (Get-Date).AddMinutes(-$ConnectionCheckIntervalMinutes))){
-        # Recently checked
-        Write-Verbose ":$($MyInvocation.MyCommand): Last connection check at $($Global:CMKLastSuccessfulConnect)."
-    }
-    else {
-        # New check required
-        Write-Verbose ":$($MyInvocation.MyCommand): Connection check..."
-        If (-not (Test-NetConnection -ComputerName $Connection.Hostname -Port 443 -WarningAction SilentlyContinue).TcpTestSucceeded) {
-            Write-Verbose "$($Connection.Hostname) ist nicht erreichbar"
-            throw [System.Net.WebException]
-        } 
-        else {
-            $Global:CMKLastSuccessfulConnect = Get-Date -Format 'o'
-        }
-    }
-
-    $PSBoundParameters.Headers = $Connection.Header
-    $PSBoundParameters.Uri = "$($Connection.APIUrl)$($Uri)"
-    $PSBoundParameters.Remove('Connection') | Out-Null
-    $PSBoundParameters.Remove('EndpointReturnsList') | Out-Null
-
-    $Response = Invoke-CustomWebRequest @PSBoundParameters
-    Write-Verbose "$([int]($Response.BaseResponse.StatusCode)) $($Response.BaseResponse.StatusDescription)"
-    if ([int]($Response.BaseResponse.StatusCode) -eq 200) {
-        # 200 Ok
-        $CheckKMObject = ($Response.Response.Content | ConvertFrom-Json)
-        $CheckKMObject | Add-Member -MemberType NoteProperty -Name ETag -Value $Response.Response.Headers.ETag
-
-        if ($EndpointReturnsList.IsPresent) {
-            return $CheckKMObject.Value
-        }
-        else {
-            return $CheckKMObject
-        }
-    }
-    elseif ((@('Post', 'Delete') -contains $Method) -and ([int]($Response.BaseResponse.StatusCode) -eq 204)) {
-        # 204 No Content
-    }
-    else {
-        # Nicht OK. Error Code lässt sich mit -verbose anzeigen.
-        throw "StatusCode: $([int]($Response.BaseResponse.StatusCode)) StatusDescription: $($Response.BaseResponse.StatusDescription)`r`nMessage: `r`n$($Response.BaseResponse.ErrorMessage)"
-    }
-}
 #endregion Connection
+
 #region Main
 function Get-CMKServerInfo {
     [CmdletBinding()]
     param(
-        [parameter(Mandatory)]
-        [object]
-        $Connection
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     return Invoke-CMKApiCall -Method Get -Uri '/version' -Connection $Connection
 }
 function Get-CMKPendingChanges {
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory)]
-        [object]
-        $Connection
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     return Invoke-CMKApiCall -Method Get -Uri '/domain-types/activation_run/collections/pending_changes' -Connection $Connection
 }
 function Invoke-CMKChangeActivation {
     [CmdletBinding()]
     param(
-	    [Parameter(Mandatory, HelpMessage = 'Abgerufen mit Get-CMKPendingChanges')]
+	    [Parameter(Mandatory = $true, HelpMessage = 'Abgerufen mit Get-CMKPendingChanges')]
         [object]
         $PendingChanges,
-        [parameter(HelpMessage = 'Sollen durch andere Nutzer durchgeführte Änderungen mit Aktiviert werden? Pflicht, wenn es welche gibt.')]
+
+        [Parameter(Mandatory = $false, HelpMessage = 'Sollen durch andere Nutzer durchgeführte Änderungen mit Aktiviert werden? Pflicht, wenn es welche gibt.')]
         [switch]
         $ForceForeignChanges,
-        [parameter(Mandatory)]
-        [object]
-        $Connection
+
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     $activateChanges = @{
         force_foreign_changes = $ForceForeignChanges.IsPresent
         redirect              = $false
-        sites                 = [array]$Connection.sitename
+        sites                 = [array]$Connection.Sitename
     } | ConvertTo-Json
-    $ConnSecret = $Connection.Header.Authorization.Split(' ')[2] | ConvertTo-SecureString -AsPlainText -Force
-    $oneTimeConnection = Get-CMKConnection -Hostname $Connection.hostname -Sitename $Connection.sitename -Username $Connection.username -Secret $ConnSecret -IfMatch $PendingChanges.Etag
+
     try {
-        $CheckMKActivationObject = Invoke-CMKApiCall -Method Post -Uri '/domain-types/activation_run/actions/activate-changes/invoke' -Body $activateChanges -Connection $oneTimeConnection
+        $CheckMKActivationObject = Invoke-CMKApiCall -Method Post -Uri '/domain-types/activation_run/actions/activate-changes/invoke' -Body $activateChanges -Connection $Connection -IfMatch $PendingChanges.Etag
     }
     catch {
         if ($($_.Exception.Message) -match "Currently there are no changes to activate.") {
@@ -325,13 +659,15 @@ function Invoke-CMKChangeActivation {
 function Get-CMKHost {
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory, ParameterSetName = 'Spezifisch')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'Spezifisch')]
         [ValidateNotNullOrEmpty()]
         [string]
         $HostName,
-        [Parameter(Mandatory, ParameterSetName = 'Spezifisch')]
-        [Parameter(Mandatory, ParameterSetName = 'Liste')]
-        $Connection
+
+        [Parameter(Mandatory = $false, ParameterSetName = 'Spezifisch')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'Liste')]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     If ($PSCmdlet.ParameterSetName -eq 'Spezifisch') {
         return Invoke-CMKApiCall -Method Get -Uri "/objects/host_config/$($HostName)" -Connection $Connection
@@ -343,22 +679,23 @@ function Get-CMKHost {
 function New-CMKHost {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
         [string]
         $HostName,
-        [Parameter(Mandatory, HelpMessage = 'Pfad zum Ordner. Anstelle von Slash bitte Tilde ~ benutzen. Case-Sensitive. Entspricht dem Attribut id im Objekt von Get-CheckMKFolder.')]
+
+        [Parameter(Mandatory = $true, HelpMessage = 'Pfad zum Ordner. Anstelle von Slash bitte Tilde ~ benutzen. Case-Sensitive. Entspricht dem Attribut id im Objekt von Get-CheckMKFolder.')]
         [string]
         $FolderPath,
-        [parameter(Mandatory)]
-        [object]
-        $Connection
+
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     $newHost = @{
         folder    = "$FolderPath"
         host_name = "$($HostName)"
     } | ConvertTo-Json
     return Invoke-CMKApiCall -Method Post -Uri '/domain-types/host_config/collections/all' -Body $newHost -Connection $Connection
-
 }
 function New-CMKClusterHost {
 <#
@@ -387,19 +724,23 @@ function New-CMKClusterHost {
 #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
         [string]
         $HostName,
-        [Parameter(Mandatory, HelpMessage = 'Pfad zum Ordner. Anstelle von Slash bitte Tilde ~ benutzen. Case-Sensitive. Entspricht dem Attribut id im Objekt von Get-CheckMKFolder.')]
+
+        [Parameter(Mandatory = $true, HelpMessage = 'Pfad zum Ordner. Anstelle von Slash bitte Tilde ~ benutzen. Case-Sensitive. Entspricht dem Attribut id im Objekt von Get-CheckMKFolder.')]
         [string]
         $FolderPath,
-        [Parameter(Mandatory=$true)]
+
+        [Parameter(Mandatory = $true)]
         [string[]]
         $Nodes,
-        [parameter(Mandatory)]
-        [object]
-        $Connection,
-        [Parameter(HelpMessage = 'Hashtable @{attribute = "value"; attr2 = "value"} siehe https://<CheckMK-Host>/<sitename>/check_mk/api/1.0/ui/#/Hosts/cmk.gui.plugins.openapi.endpoints.host_config.create_host')]
+
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection,
+
+        [Parameter(Mandatory = $false, HelpMessage = 'Hashtable @{attribute = "value"; attr2 = "value"} siehe https://<CheckMK-Host>/<sitename>/check_mk/api/1.0/ui/#/Hosts/cmk.gui.plugins.openapi.endpoints.host_config.create_host')]
         $Attributes = @{}
     )
     $newCluster = @{
@@ -423,53 +764,54 @@ function New-CMKClusterHost {
 function Rename-CMKHost {
     [CmdletBinding()]
     param(
-        [parameter(Mandatory, HelpMessage = 'Mit Get-CMKHost abgerufen')]
+        [Parameter(Mandatory = $true, HelpMessage = 'Mit Get-CMKHost abgerufen')]
         [object]
         $HostObject,
-        [parameter(Mandatory)]
+
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]
         $newHostName,
-        [parameter(Mandatory)]
-        [object]
-        $Connection
+
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     # Ist langsam. Behindert den Betrieb von CheckMK (Server steht während der Zeit). Dauer: ca 30 Sekunden
     # Im Anschluss: Invoke-CMKChangeActivation
-    $ConnSecret = $Connection.Header.Authorization.Split(' ')[2] | ConvertTo-SecureString -AsPlainText -Force
-    $oneTimeConnection = Get-CMKConnection -Hostname $Connection.hostname -Sitename $Connection.sitename -Username $Connection.username -IfMatch $HostObject.Etag -Secret $ConnSecret
     $newName = @{
         new_name = $newHostName
     } | ConvertTo-Json
-    return Invoke-CMKApiCall -Method Put -Uri "/objects/host_config/$($HostObject.id)/actions/rename/invoke" -Body $newName -Connection $oneTimeConnection
+    return Invoke-CMKApiCall -Method Put -Uri "/objects/host_config/$($HostObject.id)/actions/rename/invoke" -Body $newName -Connection $Connection -IfMatch $HostObject.Etag
 }
 function Update-CMKHost {
     [CmdletBinding()]
     param(
-        [parameter(Mandatory, HelpMessage = 'Mit Get-CMKHost abgerufen')]
+        [Parameter(Mandatory = $true, HelpMessage = 'Mit Get-CMKHost abgerufen')]
         [object]
         $HostObject,
-        [parameter(Mandatory, HelpMessage = 'Lies die Doku! https://<CheckMK-Host>/<sitename>/check_mk/api/1.0/ui/#/Hosts/cmk.gui.plugins.openapi.endpoints.host_config.update_host')]
+
+        [Parameter(Mandatory = $true, HelpMessage = 'Lies die Doku! https://<CheckMK-Host>/<sitename>/check_mk/api/1.0/ui/#/Hosts/cmk.gui.plugins.openapi.endpoints.host_config.update_host')]
         $Changeset,
-        [parameter(Mandatory)]
-        [object]
-        $Connection
+
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     # https://<CheckMK-Host>/<sitename>/check_mk/api/1.0/ui/#/Hosts/cmk.gui.plugins.openapi.endpoints.host_config.update_host
-    $ConnSecret = $Connection.Header.Authorization.Split(' ')[2] | ConvertTo-SecureString -AsPlainText -Force
-    $oneTimeConnection = Get-CMKConnection -Hostname $Connection.hostname -Sitename $Connection.sitename -Username $Connection.username -IfMatch $HostObject.Etag -Secret $ConnSecret
-    return Invoke-CMKApiCall -Method Put -Uri "/objects/host_config/$($HostObject.id)" -Body $Changeset -Connection $oneTimeConnection
+    return Invoke-CMKApiCall -Method Put -Uri "/objects/host_config/$($HostObject.id)" -Body $Changeset -Connection $Connection -IfMatch $HostObject.Etag
 }
 function Remove-CMKHost {
     [CmdletBinding()]
     param(
-        [parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]
         $HostName,
-        [parameter(Mandatory)]
-        [object]
-        $Connection
+
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     return Invoke-CMKApiCall -Method Delete -Uri "/objects/host_config/$HostName" -Connection $Connection
 }
@@ -478,23 +820,27 @@ function Remove-CMKHost {
 function Set-CMKHostAttribute {
     [CmdletBinding()]
     param(
-        [parameter(Mandatory, HelpMessage = 'Mit Get-CMKHost abgerufen', ParameterSetName = 'Update')]
-        [parameter(Mandatory, HelpMessage = 'Mit Get-CMKHost abgerufen', ParameterSetName = 'Remove')]
+        [Parameter(Mandatory = $true, HelpMessage = 'Mit Get-CMKHost abgerufen', ParameterSetName = 'Update')]
+        [Parameter(Mandatory = $true, HelpMessage = 'Mit Get-CMKHost abgerufen', ParameterSetName = 'Remove')]
         [object]
         $HostObject,
-        [parameter(Mandatory, ParameterSetName = 'Update')]
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'Update')]
         [Alias('SetAttribute')]
         [string]
         $UpdateAttribute,
-        [parameter(Mandatory, ParameterSetName = 'Update')]
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'Update')]
         $Value,
-        [parameter(Mandatory, ParameterSetName = 'Remove')]
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'Remove')]
         [string]
         $RemoveAttribute,
-        [parameter(Mandatory, ParameterSetName = 'Update')]
-        [parameter(Mandatory, ParameterSetName = 'Remove')]
-        [object]
-        $Connection
+
+        [Parameter(Mandatory = $false, ParameterSetName = 'Update')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'Remove')]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     #Hinweis zu Custom Host Attributes: Diese lassen sich anlegen und bearbeiten, aber nicht löschen. Da ist die API noch fehlerhaft.
     $Changeset = @{}
@@ -512,20 +858,23 @@ function Set-CMKHostAttribute {
 function Add-CMKHostLabel {
     [CmdletBinding()]
     param(
-        [parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
         [object]
         $HostObject,
-        [Parameter(Mandatory)]
+
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]
         $Key,
-        [Parameter(Mandatory)]
+
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]
         $Value,
-        [Parameter(Mandatory)]
-        [object]
-        $Connection
+        
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     $Labels = @{}
     If ($HostObject.extensions.attributes.labels) {
@@ -545,16 +894,18 @@ function Add-CMKHostLabel {
 function Remove-CMKHostLabel {
     [CmdletBinding()]
     param(
-        [parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
         [object]
         $HostObject,
-        [Parameter(Mandatory)]
+
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]
         $Key,
-        [Parameter(Mandatory)]
-        [object]
-        $Connection
+
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     If ($HostObject.extensions.attributes.labels) {
         $Labels = @{}
@@ -579,17 +930,20 @@ function Remove-CMKHostLabel {
 function Get-CMKFolder {
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory, HelpMessage = 'Pfad zum Ordner. Anstelle von Slash bitte Tilde ~ benutzen. Case-Sensitive. Entspricht dem Attribut id im zurückerhaltenen Objekt.', ParameterSetName = 'Spezifisch')]
+        [Parameter(Mandatory = $true, HelpMessage = 'Pfad zum Ordner. Anstelle von Slash bitte Tilde ~ benutzen. Case-Sensitive. Entspricht dem Attribut id im zurückerhaltenen Objekt.', ParameterSetName = 'Spezifisch')]
         [ValidateNotNullOrEmpty()]
         [ValidateScript({ If ( ($_ -notmatch '^~.*$') -or ($_.ToCharArray() -contains @('/', '\')) ) { throw 'Der Ordnerpfad ist nicht wohlgeformt.' } $true })]
         [string]
         $FolderPath,
-        [parameter(HelpMessage = 'Liste der Hosts im Ordner einschließen', ParameterSetName = 'Spezifisch')]
+
+        [Parameter(Mandatory = $false, HelpMessage = 'Liste der Hosts im Ordner einschließen', ParameterSetName = 'Spezifisch')]
         [switch]
         $ShowHosts,
-        [parameter(Mandatory, ParameterSetName = 'Spezifisch')]
-        [parameter(Mandatory, ParameterSetName = 'Liste')]
-        $Connection
+
+        [Parameter(Mandatory = $false, ParameterSetName = 'Spezifisch')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'Liste')]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     If ($PSCmdlet.ParameterSetName -eq 'Spezifisch') {
         If ($ShowHosts.IsPresent) {
@@ -610,15 +964,16 @@ function Get-CMKFolder {
 function Get-CMKDowntime {
     [CmdletBinding()]
     param(
-        [parameter(HelpMessage = 'Downtimes nur dieses Hosts abfragen')]
+        [Parameter(Mandatory = $false, HelpMessage = 'Downtimes nur dieses Hosts abfragen')]
         [string]
         $HostName,
+
         <#[parameter(HelpMessage = 'Downtimes nur dieses Service abfragen. Case-Sensitive')]
         [string]
         $ServiceDescription,#>
-        [parameter(Mandatory)]
-        [object]
-        $Connection
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     $QueryExtension = ''
     If ($HostName -or $ServiceDescription) {
@@ -638,25 +993,25 @@ function Get-CMKDowntime {
 function New-CMKDowntime {
     [CmdletBinding()]
     param(
-        [parameter(Mandatory, ParameterSetName = 'onHost', HelpMessage = 'Die Downtime wird für den genannten Host gesetzt')]
-        [parameter(Mandatory, ParameterSetName = 'onService', HelpMessage = 'Die Downtime wird für die genannten Services dieses Hosts gesetzt')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'onHost', HelpMessage = 'Die Downtime wird für den genannten Host gesetzt')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'onService', HelpMessage = 'Die Downtime wird für die genannten Services dieses Hosts gesetzt')]
         [ValidateNotNullOrEmpty()]
         [string]
         $HostName,
 
-        [parameter(Mandatory, ParameterSetName = 'onService', HelpMessage = 'Die Downtime wird nur für angegebene Services gesetzt (Case Sensitive)' )]
+        [Parameter(Mandatory = $true, ParameterSetName = 'onService', HelpMessage = 'Die Downtime wird nur für angegebene Services gesetzt (Case Sensitive)' )]
         [ValidateNotNullOrEmpty()]
         [string[]]
         $ServiceDescriptions,
 
-        [parameter(Mandatory = $false, ParameterSetName = 'onHost', HelpMessage = 'Startzeitpunkt ist optional. Wenn nicht befüllt wird die aktuelle Zeit als Start definiert.')]
-        [parameter(Mandatory = $false, ParameterSetName = 'onService', HelpMessage = 'Startzeitpunkt ist optional. Wenn nicht befüllt wird die aktuelle Zeit als Start definiert.')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'onHost', HelpMessage = 'Startzeitpunkt ist optional. Wenn nicht befüllt wird die aktuelle Zeit als Start definiert.')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'onService', HelpMessage = 'Startzeitpunkt ist optional. Wenn nicht befüllt wird die aktuelle Zeit als Start definiert.')]
         [datetime]
         $StartTime = (Get-Date),
 
         # EndTime muss zwingend nach StartDate liegen. Ist das nicht der Fall wird kein Fehler gemeldet, CMK legt ohne Fehlermeldung keine Downtime an.
-        [parameter(Mandatory = $true, ParameterSetName = 'onHost', HelpMessage = 'Endzeitpunkt ist nicht optional.')]
-        [parameter(Mandatory = $true, ParameterSetName = 'onService', HelpMessage = 'Endzeitpunkt ist nicht optional.')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'onHost', HelpMessage = 'Endzeitpunkt ist nicht optional.')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'onService', HelpMessage = 'Endzeitpunkt ist nicht optional.')]
         [ValidateScript({
             if ($_ -gt (Get-Date) -and $_ -gt $StartTime) {
                 $true
@@ -669,8 +1024,8 @@ function New-CMKDowntime {
         [datetime]
         $EndTime,
 
-        [parameter(ParameterSetName = 'onHost')]
-        [parameter(ParameterSetName = 'onService')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'onHost')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'onService')]
         [ValidateNotNullOrEmpty()]
         [string]
         $Comment,
@@ -681,8 +1036,8 @@ function New-CMKDowntime {
         [int]
         $Duration,
 
-        [parameter(Mandatory, ParameterSetName = 'onHost')]
-        [parameter(Mandatory, ParameterSetName = 'onService')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'onHost')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'onService')]
         [object]
         $Connection
     )
@@ -716,21 +1071,24 @@ function New-CMKDowntime {
 function Remove-CMKDowntime {
     [CmdletBinding()]
     param(
-        [parameter(Mandatory, ParameterSetName = 'byID')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'byID')]
         [int]
         $ID,
-        [parameter(Mandatory, ParameterSetName = 'byHostName')]
-        [parameter(Mandatory, ParameterSetName = 'byHostNameAndServiceDescriptions')]
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'byHostName')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'byHostNameAndServiceDescriptions')]
         [string]
         $HostName,
-        [parameter(Mandatory, ParameterSetName = 'byHostNameAndServiceDescriptions')]
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'byHostNameAndServiceDescriptions')]
         [string[]]
         $ServiceDescriptions,
-        [parameter(Mandatory, ParameterSetName = 'byHostName')]
-        [parameter(Mandatory, ParameterSetName = 'byID')]
-        [parameter(Mandatory, ParameterSetName = 'byHostNameAndServiceDescriptions')]
-        [object]
-        $Connection
+
+        [Parameter(Mandatory = $false, ParameterSetName = 'byHostName')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'byID')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'byHostNameAndServiceDescriptions')]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     $Delete = @{}
     If ($PSCmdlet.ParameterSetName -eq 'byID') {
@@ -753,6 +1111,7 @@ function Remove-CMKDowntime {
     return Invoke-CMKApiCall -Method Post -Uri '/domain-types/downtime/actions/delete/invoke' -Body $Delete -Connection $Connection
 }
 #endregion Downtimes
+
 #region Services
 function Get-CMKService {
 <#
@@ -790,27 +1149,32 @@ function Get-CMKService {
 #>
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory, ParameterSetName = 'byHostName', HelpMessage = 'Zeige Services nur eines Hosts')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'byHostName', HelpMessage = 'Zeige Services nur eines Hosts')]
         $HostName,
-        [Parameter(ParameterSetName = 'byHostName', HelpMessage = 'Filter-Ausdruck für service description als regular expression. Beispiel: "^Filesystem(.)+" (listet alle Services auf, die mit "Filesystem" beginnen)')]
-        [Parameter(ParameterSetName = 'All', HelpMessage = 'Filter-Ausdruck für service description als regular expression. Beispiel: "^Filesystem(.)+" (listet alle Services auf, die mit "Filesystem" beginnen)')]
+
+        [Parameter(Mandatory = $false, ParameterSetName = 'byHostName', HelpMessage = 'Filter-Ausdruck für service description als regular expression. Beispiel: "^Filesystem(.)+" (listet alle Services auf, die mit "Filesystem" beginnen)')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'All', HelpMessage = 'Filter-Ausdruck für service description als regular expression. Beispiel: "^Filesystem(.)+" (listet alle Services auf, die mit "Filesystem" beginnen)')]
         [ValidateNotNullOrEmpty()]
         $DescriptionRegExp,
-        [Parameter(ParameterSetName = 'byHostName', HelpMessage = 'Filter auf Service state (OK, WARN, CRIT, UNKNOWN)')]
-        [Parameter(ParameterSetName = 'All', HelpMessage = 'Filter auf Service state (OK, WARN, CRIT, UNKNOWN)')]
+
+        [Parameter(Mandatory = $false, ParameterSetName = 'byHostName', HelpMessage = 'Filter auf Service state (OK, WARN, CRIT, UNKNOWN)')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'All', HelpMessage = 'Filter auf Service state (OK, WARN, CRIT, UNKNOWN)')]
         [ValidateSet('', 'OK', 'WARN', 'CRIT', 'UNKNOWN')]
         [string[]]$State,
-        [Parameter(ParameterSetName = 'byHostName', HelpMessage = 'Filter host_groups, multiple values accepted (link using logical OR), case-insensitive equality')]
-        [Parameter(ParameterSetName = 'All', HelpMessage = 'Filter host_groups, multiple values accepted (link using logical OR), case-insensitive equality')]
+
+        [Parameter(Mandatory = $false, ParameterSetName = 'byHostName', HelpMessage = 'Filter host_groups, multiple values accepted (link using logical OR), case-insensitive equality')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'All', HelpMessage = 'Filter host_groups, multiple values accepted (link using logical OR), case-insensitive equality')]
         [string[]]$HostGroup,
-        [Parameter(ParameterSetName = 'byHostName', HelpMessage = 'auszugebende Felder')]
-        [Parameter(ParameterSetName = 'All', HelpMessage = 'auszugebende Felder')]
+
+        [Parameter(Mandatory = $false, ParameterSetName = 'byHostName', HelpMessage = 'auszugebende Felder')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'All', HelpMessage = 'auszugebende Felder')]
         [ValidateSet('host_name', 'description', 'state', 'plugin_output', 'host_groups')]
         $Columns = @('host_name', 'description'),
-        [Parameter(Mandatory, ParameterSetName = 'byHostName')]
-        [Parameter(Mandatory, ParameterSetName = 'All')]
-        [object]
-        $Connection
+
+        [Parameter(Mandatory = $false, ParameterSetName = 'byHostName')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'All')]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
 
     $QueryExtension = ''
@@ -894,21 +1258,38 @@ function Get-CMKService {
         return Invoke-CMKApiCall -Method Get -Uri "/domain-types/service/collections/all$($QueryExtension)" -Connection $Connection -EndpointReturnsList
     }
 }
-function Invoke-CMKServiceDiscovery {
+
+function Get-CMKServiceDiscoveryResult {
     [CmdletBinding()]
     param (
-        [parameter(Mandatory = $true, HelpMessage = 'Mit Get-CMKHost abgerufen')]
+        [Parameter(Mandatory = $true, HelpMessage = 'Mit Get-CMKHost abgerufen')]
         [string]
         $HostName,
 
         [Parameter(Mandatory = $false)]
-        [ValidateSet('new','remove','fix_all','tabula_rasa','refresh','only_host_labels')]
+        [CMKConnection]
+        $Connection = $CMKConnection
+    )
+
+    return Invoke-CMKApiCall -Method Get -Uri "/objects/service_discovery/$($HostName)" -Connection $Connection
+}
+
+function Invoke-CMKServiceDiscovery {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, HelpMessage = 'Mit Get-CMKHost abgerufen')]
+        [string]
+        $HostName,
+
+        # refresh is also possible, but apparently produces an undocumented error code for the API call
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('new','remove','fix_all','tabula_rasa','only_host_labels')]
         [string]
         $Mode = 'fix_all',
 
-        [Parameter(Mandatory = $true)]
-        [object]
-        $Connection
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
 
     $Body = @{
@@ -919,6 +1300,7 @@ function Invoke-CMKServiceDiscovery {
     return Invoke-CMKApiCall -Method Post -Uri '/domain-types/service_discovery_run/actions/start/invoke' -Body $Body -Connection $Connection
 }
 #endregion Services
+
 #region Users
 function Get-CMKUser {
     [CmdletBinding()]
@@ -928,10 +1310,10 @@ function Get-CMKUser {
         [string]
         $Username,
 
-        [Parameter(Mandatory = $true, ParameterSetName = 'Spezifisch')]
-        [Parameter(Mandatory = $true, ParameterSetName = 'Liste')]
-        [object]
-        $Connection
+        [Parameter(Mandatory = $false, ParameterSetName = 'Spezifisch')]
+        [Parameter(Mandatory = $false, ParameterSetName = 'Liste')]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     
     if ($PSCmdlet.ParameterSetName -eq 'Spezifisch') {
@@ -951,17 +1333,15 @@ function Update-CMKUser {
         [Parameter(Mandatory = $true)]
         $Changeset,
 
-        [Parameter(Mandatory = $true)]
-        [object]
-        $Connection
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     
     Write-Verbose -Message $UserObject
     Write-Verbose -Message $Changeset
 
-    $ConnSecret = $Connection.Header.Authorization.Split(' ')[2] | ConvertTo-SecureString -AsPlainText -Force
-    $oneTimeConnection = Get-CMKConnection -Hostname $Connection.hostname -Sitename $Connection.sitename -Username $Connection.username -Secret $ConnSecret -IfMatch $UserObject.Etag
-    return Invoke-CMKApiCall -Method Put -Uri "/objects/user_config/$($UserObject.Id)" -Body $Changeset -Connection $oneTimeConnection
+    return Invoke-CMKApiCall -Method Put -Uri "/objects/user_config/$($UserObject.Id)" -Body $Changeset -Connection $Connection -IfMatch $UserObject.ETag
 }
 
 function Set-CMKUserAttribute {
@@ -978,9 +1358,9 @@ function Set-CMKUserAttribute {
         [Parameter(Mandatory = $true)]
         $Value,
 
-        [Parameter(Mandatory = $true)]
-        [object]
-        $Connection
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
     )
     
     $Changeset = @{
@@ -989,10 +1369,13 @@ function Set-CMKUserAttribute {
 
     $Changeset = $Changeset | ConvertTo-Json
 
-    return Update-CMKUser -UserObject $UserObject -Changeset $Changeset -Connection $Connection -Verbose
+    return Update-CMKUser -UserObject $UserObject -Changeset $Changeset -Connection $Connection
 }
 #endregion
 $ExportableFunctions = @(
+    'Connect-CMK'
+    'Disconnect-CMK'
+    'Test-CMKConnection'
     'Get-CMKConnection'
     'Invoke-CMKApiCall'
     'Get-CMKServerInfo'
@@ -1013,6 +1396,7 @@ $ExportableFunctions = @(
     'Get-CMKPendingChanges'
     'Get-CMKService'
     'Invoke-CMKServiceDiscovery'
+    'Get-CMKServiceDiscoveryResult'
     'Get-CMKUser'
     'Update-CMKUser'
     'Set-CMKUserAttribute'
