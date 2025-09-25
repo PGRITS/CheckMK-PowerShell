@@ -1274,6 +1274,21 @@ function Get-CMKServiceDiscoveryResult {
     return Invoke-CMKApiCall -Method Get -Uri "/objects/service_discovery/$($HostName)" -Connection $Connection
 }
 
+function Get-CMKServiceDiscoveryState {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, HelpMessage = 'Mit Get-CMKHost abgerufen')]
+        [string]
+        $HostName,
+
+        [Parameter(Mandatory = $false)]
+        [CMKConnection]
+        $Connection = $CMKConnection
+    )
+
+    return Invoke-CMKApiCall -Method Get -Uri "/objects/service_discovery_run/$($HostName)" -Connection $Connection
+}
+
 function Invoke-CMKServiceDiscovery {
     [CmdletBinding()]
     param (
@@ -1397,6 +1412,7 @@ $ExportableFunctions = @(
     'Get-CMKService'
     'Invoke-CMKServiceDiscovery'
     'Get-CMKServiceDiscoveryResult'
+    'Get-CMKServiceDiscoveryState'
     'Get-CMKUser'
     'Update-CMKUser'
     'Set-CMKUserAttribute'
